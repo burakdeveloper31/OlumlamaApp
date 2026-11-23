@@ -8,8 +8,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
@@ -57,7 +59,8 @@ class MainActivity : AppCompatActivity() {
 
         val statusText = TextView(this).apply {
             val active = prefs.getBoolean("is_active", false)
-            text = if (active) "Durum: AKTİF (Sırayla çalışıyor)" else "Durum: DURDURULDU"
+            val savedMinutes = prefs.getLong("interval_minutes", 60L)
+            text = if (active) "Durum: AKTİF ($savedMinutes dk aralıkla)" else "Durum: DURDURULDU"
             textSize = 15f
             setTextColor(if (active) Color.parseColor("#4CAF50") else Color.parseColor("#FF5252"))
             setPadding(0, 0, 0, 36)
@@ -89,15 +92,39 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(context, "En az 1 dakika giriniz.", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
+
+                // Android'in arka planda servisi kapatmasını önlemek için pil optimizasyon muafiyeti iste
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                    if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                        try {
+                            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                data = Uri.parse("package:$packageName")
+                            }
+                            startActivity(intent)
+                        } catch (e: Exception) {
+                            // Cihaz doğrudan diyaloğu desteklemiyorsa genel ayarlara yönlendir
+                        }
+                    }
+                }
+
+                // Eski servis veya alarm varsa temizle
+                stopService(Intent(context, OlumlamaService::class.java))
+                cancelAlarm()
+
+                // 1. cümleden (index 0) başlat ve aktif olarak kaydet
                 prefs.edit()
                     .putBoolean("is_active", true)
                     .putLong("interval_minutes", minutes)
+                    .putInt("current_index", 0)
                     .apply()
 
-                AlarmReceiver().scheduleNextAlarm(context, minutes)
+                val serviceIntent = Intent(context, OlumlamaService::class.java)
+                ContextCompat.startForegroundService(context, serviceIntent)
+
                 statusText.text = "Durum: AKTİF ($minutes dk aralıkla)"
                 statusText.setTextColor(Color.parseColor("#4CAF50"))
-                Toast.makeText(context, "$minutes dakikada bir sırayla bildirim gelecek.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "1. cümleden başlatıldı. Durdur diyene kadar kesintisiz çalışacak.", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -107,6 +134,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             setOnClickListener {
                 prefs.edit().putBoolean("is_active", false).apply()
+                stopService(Intent(context, OlumlamaService::class.java))
                 cancelAlarm()
                 statusText.text = "Durum: DURDURULDU"
                 statusText.setTextColor(Color.parseColor("#FF5252"))
@@ -122,9 +150,10 @@ class MainActivity : AppCompatActivity() {
                 val list = AlarmReceiver.getAffirmations(context)
                 if (list.isEmpty()) return@setOnClickListener
                 val currentIndex = prefs.getInt("current_index", 0)
-                val msg = list[currentIndex % list.size]
-                prefs.edit().putInt("current_index", (currentIndex + 1) % list.size).apply()
-                AlarmReceiver().showHeadsUpNotification(context, msg)
+                val safeIndex = currentIndex % list.size
+                val msg = list[safeIndex]
+                prefs.edit().putInt("current_index", (safeIndex + 1) % list.size).apply()
+                AlarmReceiver().showHeadsUpNotification(context, "(${safeIndex + 1}/${list.size}) $msg")
             }
         }
 
@@ -170,22 +199,27 @@ class MainActivity : AppCompatActivity() {
                 AlarmReceiver.saveAffirmations(context, list)
                 newAffirmationInput.text.clear()
                 refreshAffirmationList()
-                Toast.makeText(context, "Olumlama eklendi!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Olumlama eklendi (Toplam: ${list.size})", Toast.LENGTH_SHORT).show()
             }
         }
 
-        val listHeader = TextView(this).apply {
-            text = "Kayıtlı Olumlamalar (Silmek için yanındaki X'e bas)"
-            textSize = 14f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 40, 0, 16)
+        val listTitle = TextView(this).apply {
+            text = "Kayıtlı Olumlama Cümleleri"
+            textSize = 18f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setPadding(0, 48, 0, 16)
         }
 
         listContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
         }
 
-        val params = LinearLayout.LayoutParams(
+        val spaceParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
@@ -195,17 +229,16 @@ class MainActivity : AppCompatActivity() {
         rootLayout.addView(titleText)
         rootLayout.addView(statusText)
         rootLayout.addView(labelInterval)
-        rootLayout.addView(intervalInput, params)
-        rootLayout.addView(btnStart, params)
-        rootLayout.addView(btnStop, params)
-        rootLayout.addView(btnTest, params)
-        rootLayout.addView(btnResetOrder, params)
-
+        rootLayout.addView(intervalInput, spaceParams)
+        rootLayout.addView(btnStart, spaceParams)
+        rootLayout.addView(btnStop, spaceParams)
+        rootLayout.addView(btnTest, spaceParams)
+        rootLayout.addView(btnResetOrder, spaceParams)
         rootLayout.addView(addTitle)
-        rootLayout.addView(newAffirmationInput, params)
-        rootLayout.addView(btnAdd, params)
-        rootLayout.addView(listHeader)
-        rootLayout.addView(listContainer, params)
+        rootLayout.addView(newAffirmationInput, spaceParams)
+        rootLayout.addView(btnAdd, spaceParams)
+        rootLayout.addView(listTitle)
+        rootLayout.addView(listContainer)
 
         scrollView.addView(rootLayout)
         setContentView(scrollView)
@@ -217,64 +250,59 @@ class MainActivity : AppCompatActivity() {
         listContainer.removeAllViews()
         val list = AlarmReceiver.getAffirmations(this)
 
-        list.forEachIndexed { index, item ->
-            val row = LinearLayout(this).apply {
+        list.forEachIndexed { index, affirmation ->
+            val itemLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setBackgroundColor(Color.parseColor("#1E1E1E"))
-                setPadding(24, 20, 16, 20)
+                setPadding(24, 20, 24, 20)
                 gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(0, 0, 0, 16)
+                }
             }
 
-            val tv = TextView(this).apply {
-                text = "${index + 1}. $item"
-                setTextColor(Color.WHITE)
+            val textView = TextView(this).apply {
+                text = "${index + 1}. $affirmation"
                 textSize = 14f
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                setTextColor(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f
+                ).apply {
+                    setMargins(0, 0, 16, 0)
+                }
             }
 
             val btnDelete = Button(this).apply {
-                text = "X"
-                setTextColor(Color.parseColor("#FF5252"))
-                setBackgroundColor(Color.TRANSPARENT)
-                layoutParams = LinearLayout.LayoutParams(110, LinearLayout.LayoutParams.WRAP_CONTENT)
+                text = "Sil"
+                setBackgroundColor(Color.parseColor("#B71C1C"))
+                setTextColor(Color.WHITE)
+                textSize = 12f
                 setOnClickListener {
                     if (list.size <= 1) {
-                        Toast.makeText(context, "Listede en az 1 olumlama kalmalıdır.", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Listede en az 1 cümle kalmalıdır.", Toast.LENGTH_SHORT).show()
                         return@setOnClickListener
                     }
                     list.removeAt(index)
                     AlarmReceiver.saveAffirmations(context, list)
+                    // Silme işleminden sonra indeks taşmasını önle
+                    val prefs = getSharedPreferences("OlumlamaPrefs", Context.MODE_PRIVATE)
+                    val currentIdx = prefs.getInt("current_index", 0)
+                    if (currentIdx >= list.size) {
+                        prefs.edit().putInt("current_index", 0).apply()
+                    }
                     refreshAffirmationList()
-                    Toast.makeText(context, "Silindi.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Cümle silindi.", Toast.LENGTH_SHORT).show()
                 }
             }
 
-            val rowParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                setMargins(0, 0, 0, 12)
-            }
-
-            row.addView(tv)
-            row.addView(btnDelete)
-            listContainer.addView(row, rowParams)
-        }
-    }
-
-    private fun checkPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            if (!alarmManager.canScheduleExactAlarms()) {
-                startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM))
-            }
+            itemLayout.addView(textView)
+            itemLayout.addView(btnDelete)
+            listContainer.addView(itemLayout)
         }
     }
 
@@ -282,8 +310,23 @@ class MainActivity : AppCompatActivity() {
         val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(this, AlarmReceiver::class.java)
         val pendingIntent = PendingIntent.getBroadcast(
-            this, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            this,
+            1,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         alarmManager.cancel(pendingIntent)
+    }
+
+    private fun checkPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     }
 }
